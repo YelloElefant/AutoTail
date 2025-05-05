@@ -9,12 +9,19 @@ NC='\033[0m'
 VERBOSE=false
 DRY_RUN=false
 
+# Initialize variables
+AUTO_DETECT=true
+MANUAL_INTERFACE=""
+MANUAL_SUBNET=""
+EXIT_NODE=false
+STRICT_NAT_SUBNET=""
+STRICT_NAT_TARGET=""
+
 # --- Logging Function ---
 log() {
   local level="$1"
   local message="$2"
   
-  # Always show errors/warnings, verbose shows info/debug
   if [ "$VERBOSE" = true ] || [ "$level" = "WARN" ] || [ "$level" = "ERROR" ]; then
     case "$level" in
       "INFO") color="${GREEN}" ;;
@@ -69,7 +76,27 @@ while [[ "$#" -gt 0 ]]; do
       DRY_RUN=true
       shift
       ;;
-    # [Previous argument cases here...]
+    -i|--interface)
+      MANUAL_INTERFACE="$2"
+      AUTO_DETECT=false
+      shift 2
+      ;;
+    -s|--subnet)
+      MANUAL_SUBNET="$2"
+      shift 2
+      ;;
+    --strict-nat)
+      STRICT_NAT_SUBNET="$2"
+      shift 2
+      ;;
+    --strict-nat-target)
+      STRICT_NAT_TARGET="$2"
+      shift 2
+      ;;
+    -e|--exit-node)
+      EXIT_NODE=true
+      shift
+      ;;
     -h|--help)
       show_help
       ;;
@@ -87,22 +114,101 @@ if [ "$DRY_RUN" = true ]; then
   log "WARN" "DRY RUN MODE - No changes will be made"
 fi
 
-# --- System Checks ---
-log "DEBUG" "Checking system dependencies..."
+# --- Validate Strict NAT ---
+if [ -n "$STRICT_NAT_SUBNET" ] || [ -n "$STRICT_NAT_TARGET" ]; then
+  if [ -z "$STRICT_NAT_SUBNET" ] || [ -z "$STRICT_NAT_TARGET" ]; then
+    log "ERROR" "Both --strict-nat and --strict-nat-target must be specified"
+    exit 1
+  fi
+  log "INFO" "Strict NAT configured: $STRICT_NAT_SUBNET → $STRICT_NAT_TARGET"
+fi
+
+# --- Network Detection ---
+if [ "$AUTO_DETECT" != false ]; then
+  INTERFACE=$(ip route | grep default | awk '{print $5}' | head -n1)
+  DETECTED_SUBNET=$(ip -o -4 addr show "$INTERFACE" | awk '{print $4}' | head -n1)
+  log "INFO" "Auto-detected: Interface=$INTERFACE, Subnet=$DETECTED_SUBNET"
+else
+  if [ -z "$MANUAL_INTERFACE" ]; then
+    log "ERROR" "Manual mode requires --interface"
+    exit 1
+  fi
+  INTERFACE="$MANUAL_INTERFACE"
+  if ! ip link show "$INTERFACE" &>/dev/null; then
+    log "ERROR" "Interface $INTERFACE does not exist"
+    exit 1
+  fi
+  log "INFO" "Using manual interface: $INTERFACE"
+fi
+
+# --- Docker Setup ---
+log "INFO" "Checking Docker installation..."
 if ! command -v docker &>/dev/null; then
   if [ "$DRY_RUN" = true ]; then
     log "INFO" "Would install Docker"
   else
     log "INFO" "Installing Docker..."
-    curl -fsSL https://get.docker.com | sh
+    curl -fsSL https://get.docker.com | sh || {
+      log "ERROR" "Docker installation failed"
+      exit 1
+    }
+    sudo usermod -aG docker "$USER"
+    log "WARN" "You must log out and back in for Docker permissions"
+    exit 0
   fi
 fi
 
-# --- Strict NAT Simulation ---
+# --- IP Forwarding ---
+log "INFO" "Configuring IP forwarding..."
+dryrun sudo sysctl -w net.ipv4.ip_forward=1
+dryrun sudo sysctl -w net.ipv6.conf.all.forwarding=1
+
+# --- Tailscale Docker Setup ---
+TAILSCALE_DIR="$HOME/tailscale"
+log "INFO" "Creating Tailscale directory at $TAILSCALE_DIR"
+dryrun mkdir -p "$TAILSCALE_DIR"
+
+if [ "$DRY_RUN" = false ]; then
+  cd "$TAILSCALE_DIR" || {
+    log "ERROR" "Failed to enter $TAILSCALE_DIR"
+    exit 1
+  }
+fi
+
+log "INFO" "Generating docker-compose.yml"
+cat <<EOF | dryrun tee docker-compose.yml >/dev/null
+version: '3'
+services:
+  tailscale:
+    image: tailscale/tailscale:latest
+    container_name: tailscale
+    network_mode: "host"
+    cap_add:
+      - NET_ADMIN
+      - SYS_MODULE
+    volumes:
+      - ./tsstate:/var/lib/tailscale
+      - /dev/net/tun:/dev/net/tun
+    restart: unless-stopped
+EOF
+
+# --- Start Container ---
+log "INFO" "Starting Tailscale container..."
+dryrun docker compose up -d
+
+# --- Strict NAT Rules ---
 if [ -n "$STRICT_NAT_SUBNET" ]; then
-  log "INFO" "Configuring NAT: $STRICT_NAT_SUBNET → $STRICT_NAT_TARGET"
+  log "INFO" "Configuring iptables for Strict NAT..."
   dryrun sudo iptables -t nat -A PREROUTING -d "$STRICT_NAT_TARGET" -j NETMAP --to "$STRICT_NAT_SUBNET"
   dryrun sudo iptables -t nat -A POSTROUTING -s "$STRICT_NAT_SUBNET" -j NETMAP --to "$STRICT_NAT_TARGET"
+  
+  if [ "$DRY_RUN" = false ]; then
+    if ! command -v netfilter-persistent &>/dev/null; then
+      log "INFO" "Installing iptables-persistent..."
+      sudo apt-get update && sudo apt-get install -y iptables-persistent
+    fi
+    dryrun sudo netfilter-persistent save
+  fi
 fi
 
 # --- Tailscale Up Command ---
@@ -114,7 +220,12 @@ if [ "$DRY_RUN" = true ]; then
   log "INFO" "Would execute: tailscale up $TS_UP_ARGS"
 else
   log "INFO" "Activating Tailscale..."
-  docker exec tailscale tailscale up $TS_UP_ARGS
+  docker exec tailscale tailscale up $TS_UP_ARGS 2>&1 | tee /tmp/tailscale-login.log
+  LOGIN_URL=$(grep -oE 'https://login.tailscale.com/[^ ]+' /tmp/tailscale-login.log | head -n1)
+  
+  if [[ -n "$LOGIN_URL" ]]; then
+    log "INFO" "Login required: $LOGIN_URL"
+  fi
 fi
 
 log "INFO" "Setup complete"
