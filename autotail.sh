@@ -216,8 +216,9 @@ if [ -n "$STRICT_NAT_SUBNET" ]; then
   dryrun sudo iptables -t nat -F  
   dryrun sudo iptables -F
   dryrun sudo iptables -X
+  
   dryrun sudo iptables -t nat -A PREROUTING -i "tailscale0" -d "$STRICT_NAT_TARGET" -j NETMAP --to "$STRICT_NAT_SUBNET"
-  dryrun sudo iptables -t nat -A POSTROUTING -o "$INTERFACE" -s "$STRICT_NAT_SUBNET" -j NETMAP --to "$STRICT_NAT_TARGET"
+  dryrun sudo iptables -t nat -A POSTROUTING -o "tailscale0" -s "$STRICT_NAT_SUBNET" -j NETMAP --to "$STRICT_NAT_TARGET"
   
   dryrun sudo ip route add $STRICT_NAT_TARGET dev "tailscale0"
   
