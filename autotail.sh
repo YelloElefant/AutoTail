@@ -205,11 +205,21 @@ if [ "$CONTAINER_RUNNING" != true ]; then
   exit 1
 fi
 
+
+dryrun sudo iptables -A FORWARD -i "tailscale0" -o $INTERFACE -j ACCEPT
+dryrun sudo iptables -A FORWARD -i $INTERFACE -o "tailscale0" -m state --state RELATED,ESTABLISHED -j ACCEPT
+
+
 # --- Strict NAT Rules ---
 if [ -n "$STRICT_NAT_SUBNET" ]; then
   log "INFO" "Configuring iptables for Strict NAT..."
-  dryrun sudo iptables -t nat -A PREROUTING -d "$STRICT_NAT_TARGET" -j NETMAP --to "$STRICT_NAT_SUBNET"
-  dryrun sudo iptables -t nat -A POSTROUTING -s "$STRICT_NAT_SUBNET" -j NETMAP --to "$STRICT_NAT_TARGET"
+  dryrun sudo iptables -t nat -F  
+  dryrun sudo iptables -F
+  dryrun sudo iptables -X
+  dryrun sudo iptables -t nat -A PREROUTING -i "tailscale0" -d "$STRICT_NAT_TARGET" -j NETMAP --to "$STRICT_NAT_SUBNET"
+  dryrun sudo iptables -t nat -A POSTROUTING -o "$INTERFACE" -s "$STRICT_NAT_SUBNET" -j NETMAP --to "$STRICT_NAT_TARGET"
+  
+  dryrun sudo ip route add $STRICT_NAT_TARGET dev "tailscale0"
   
   if [ "$DRY_RUN" = false ]; then
     if ! command -v netfilter-persistent &>/dev/null; then
@@ -221,7 +231,7 @@ if [ -n "$STRICT_NAT_SUBNET" ]; then
 fi
 
 # --- Tailscale Up Command ---
-TS_UP_ARGS="--accept-routes --reset --hostname=$HOSTNAME"
+TS_UP_ARGS=""
 [ -n "$MANUAL_SUBNET" ] && TS_UP_ARGS+=" --advertise-routes=$MANUAL_SUBNET"
 [ "$EXIT_NODE" = true ] && TS_UP_ARGS+=" --advertise-exit-node"
 
@@ -234,7 +244,7 @@ else
   
   if [[ -n "$LOGIN_URL" ]]; then
     log "INFO" "\n[🔗 LOGIN REQUIRED] Authenticate here:"
-    log "INFO" "   $LOGIN_URL"
+    log "INFO" "   $LOGIN_URL" 
   fi
 fi
 
