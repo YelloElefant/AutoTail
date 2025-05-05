@@ -55,13 +55,6 @@ show_help() {
   echo "  -v, --verbose          Show detailed output"
   echo "  --dry-run              Simulate changes without executing"
   echo "  -h, --help             Show help"
-  echo ""
-  echo -e "${YELLOW}Examples:${NC}"
-  echo "  # Dry run with verbose output"
-  echo "  $0 -s 192.168.2.0/24 --strict-nat 192.168.2.0/24 -v --dry-run"
-  echo ""
-  echo "  # Real run with minimal output"
-  echo "  $0 -s 192.168.2.0/24 --exit-node"
   exit 0
 }
 
@@ -127,13 +120,15 @@ fi
 if [ "$AUTO_DETECT" != false ]; then
   INTERFACE=$(ip route | grep default | awk '{print $5}' | head -n1)
   DETECTED_SUBNET=$(ip -o -4 addr show "$INTERFACE" | awk '{print $4}' | head -n1)
-  log "INFO" "Auto-detected: Interface=$INTERFACE, Subnet=$DETECTED_SUBNET"
+  HOSTNAME=$(hostname | cut -d'.' -f1)
+  log "INFO" "Auto-detected: Interface=$INTERFACE, Subnet=$DETECTED_SUBNET, Hostname=$HOSTNAME"
 else
   if [ -z "$MANUAL_INTERFACE" ]; then
     log "ERROR" "Manual mode requires --interface"
     exit 1
   fi
   INTERFACE="$MANUAL_INTERFACE"
+  HOSTNAME=$(hostname | cut -d'.' -f1)
   if ! ip link show "$INTERFACE" &>/dev/null; then
     log "ERROR" "Interface $INTERFACE does not exist"
     exit 1
@@ -168,33 +163,47 @@ TAILSCALE_DIR="$HOME/tailscale"
 log "INFO" "Creating Tailscale directory at $TAILSCALE_DIR"
 dryrun mkdir -p "$TAILSCALE_DIR"
 
-if [ "$DRY_RUN" = false ]; then
-  cd "$TAILSCALE_DIR" || {
-    log "ERROR" "Failed to enter $TAILSCALE_DIR"
-    exit 1
-  }
-fi
+cat <<EOF | dryrun tee "$TAILSCALE_DIR/docker-compose.yml" >/dev/null
+version: '3.8'
 
-log "INFO" "Generating docker-compose.yml"
-cat <<EOF | dryrun tee docker-compose.yml >/dev/null
-version: '3'
 services:
   tailscale:
-    image: tailscale/tailscale:latest
+    image: tailscale/tailscale
     container_name: tailscale
+    restart: unless-stopped
     network_mode: "host"
     cap_add:
       - NET_ADMIN
       - SYS_MODULE
     volumes:
-      - ./tsstate:/var/lib/tailscale
+      - ./data:/var/lib/tailscale
       - /dev/net/tun:/dev/net/tun
-    restart: unless-stopped
+      - /etc/machine-id:/etc/machine-id
+    command: tailscaled
 EOF
 
 # --- Start Container ---
 log "INFO" "Starting Tailscale container..."
-dryrun docker compose up -d
+dryrun docker compose -f "$TAILSCALE_DIR/docker-compose.yml" up -d
+
+# Wait for container to stabilize
+MAX_RETRIES=5
+RETRY_DELAY=3
+CONTAINER_RUNNING=false
+for i in $(seq 1 $MAX_RETRIES); do
+  if docker inspect -f '{{.State.Running}}' tailscale 2>/dev/null | grep -q "true"; then
+    CONTAINER_RUNNING=true
+    break
+  fi
+  log "WARN" "Container not ready (attempt $i/$MAX_RETRIES)..."
+  sleep $RETRY_DELAY
+done
+
+if [ "$CONTAINER_RUNNING" != true ]; then
+  log "ERROR" "Tailscale container failed to start"
+  docker logs tailscale
+  exit 1
+fi
 
 # --- Strict NAT Rules ---
 if [ -n "$STRICT_NAT_SUBNET" ]; then
@@ -212,19 +221,20 @@ if [ -n "$STRICT_NAT_SUBNET" ]; then
 fi
 
 # --- Tailscale Up Command ---
-TS_UP_ARGS="--accept-routes"
+TS_UP_ARGS="--accept-routes --reset --hostname=$HOSTNAME"
 [ -n "$MANUAL_SUBNET" ] && TS_UP_ARGS+=" --advertise-routes=$MANUAL_SUBNET"
 [ "$EXIT_NODE" = true ] && TS_UP_ARGS+=" --advertise-exit-node"
 
+log "INFO" "Activating Tailscale..."
 if [ "$DRY_RUN" = true ]; then
   log "INFO" "Would execute: tailscale up $TS_UP_ARGS"
 else
-  log "INFO" "Activating Tailscale..."
   docker exec tailscale tailscale up $TS_UP_ARGS 2>&1 | tee /tmp/tailscale-login.log
   LOGIN_URL=$(grep -oE 'https://login.tailscale.com/[^ ]+' /tmp/tailscale-login.log | head -n1)
   
   if [[ -n "$LOGIN_URL" ]]; then
-    log "INFO" "Login required: $LOGIN_URL"
+    log "INFO" "\n[🔗 LOGIN REQUIRED] Authenticate here:"
+    log "INFO" "   $LOGIN_URL"
   fi
 fi
 
