@@ -148,6 +148,7 @@ if ! command -v docker &>/dev/null; then
       exit 1
     }
     sudo usermod -aG docker "$USER"
+    sudo newgrp docker
     log "WARN" "You must log out and back in for Docker permissions"
     exit 0
   fi
@@ -219,8 +220,6 @@ if [ -n "$STRICT_NAT_SUBNET" ]; then
   
   dryrun sudo iptables -t nat -A PREROUTING -i "tailscale0" -d "$STRICT_NAT_TARGET" -j NETMAP --to "$STRICT_NAT_SUBNET"
   dryrun sudo iptables -t nat -A POSTROUTING -o "tailscale0" -s "$STRICT_NAT_SUBNET" -j NETMAP --to "$STRICT_NAT_TARGET"
-  
-  dryrun sudo ip route add $STRICT_NAT_TARGET dev "tailscale0"
   
   if [ "$DRY_RUN" = false ]; then
     if ! command -v netfilter-persistent &>/dev/null; then
